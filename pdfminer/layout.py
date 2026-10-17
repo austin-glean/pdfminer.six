@@ -26,7 +26,6 @@ from pdfminer.utils import (
     fsplit,
     get_bound,
     matrix2str,
-    uniq,
 )
 
 logger = logging.getLogger(__name__)
@@ -782,32 +781,115 @@ class LTLayoutContainer(LTContainer[LTComponent]):
         laparams: LAParams,
         lines: Iterable[LTTextLine],
     ) -> Iterator[LTTextBox]:
-        """Group neighboring lines to textboxes"""
+        """Group neighboring lines to textboxes
+
+        Each line, in order, forms a new box with its neighbors and the lines
+        already grouped with them, so boxes are the connected components of the
+        neighbor relation. Boxes are merged with union-find and their members
+        are kept in linked lists. This keeps grouping linear in the number of
+        neighbor pairs, even when one box grows to thousands of lines.
+        """
+        lines = list(dict.fromkeys(lines))
         plane: Plane[LTTextLine] = Plane(self.bbox)
         plane.extend(lines)
-        boxes: dict[LTTextLine, LTTextBox] = {}
-        for line in lines:
-            neighbors = line.find_neighbors(plane, laparams.line_margin)
-            members = [line]
-            for obj1 in neighbors:
-                members.append(obj1)
-                if obj1 in boxes:
-                    members.extend(boxes.pop(obj1))
-            if isinstance(line, LTTextLineHorizontal):
-                box: LTTextBox = LTTextBoxHorizontal()
+        index = {line: i for i, line in enumerate(lines)}
+        n = len(lines)
+        # Union-find over line indices. Each root also stores its box: the
+        # members in order as a linked list (head, tail, next_, prev), and the
+        # line that last rebuilt the box, whose orientation sets the box type.
+        parent = list(range(n))
+        size = [1] * n
+        head = [-1] * n
+        tail = [-1] * n
+        builder = list(range(n))
+        next_ = [-1] * n
+        prev = [-1] * n
+        grouped = [False] * n
+
+        def find(i: int) -> int:
+            root = i
+            while parent[root] != root:
+                root = parent[root]
+            while parent[i] != root:
+                parent[i], i = root, parent[i]
+            return root
+
+        def unlink(i: int, root: int) -> None:
+            if prev[i] == -1:
+                head[root] = next_[i]
+            else:
+                next_[prev[i]] = next_[i]
+            if next_[i] == -1:
+                tail[root] = prev[i]
+            else:
+                prev[next_[i]] = prev[i]
+
+        for i, line in enumerate(lines):
+            neighbors = [
+                index[obj] for obj in line.find_neighbors(plane, laparams.line_margin)
+            ]
+            if i not in neighbors:
+                # Only lines with an empty bbox miss themselves, and analyze()
+                # filters those out. Treat every line as its own neighbor so
+                # that it always takes the rest of its current box along.
+                neighbors.append(i)
+            # The new box lists this line, then each neighbor followed by the
+            # rest of the box that neighbor was in, keeping each line's first
+            # occurrence.
+            own_root = find(i) if grouped[i] else -1
+            if own_root != -1:
+                unlink(i, own_root)
+            prev[i] = next_[i] = -1
+            last = i
+            merged: set[int] = set()
+            new_root = -1
+            new_members = [i] if own_root == -1 else []
+            for j in neighbors:
+                if not grouped[j]:
+                    if j != i:
+                        next_[last], prev[j], next_[j], last = j, last, -1, j
+                        new_members.append(j)
+                    continue
+                root = own_root if j == i else find(j)
+                if root in merged:
+                    continue
+                merged.add(root)
+                if new_root == -1 or size[root] > size[new_root]:
+                    new_root = root
+                if j != i:
+                    unlink(j, root)
+                    next_[last], prev[j], next_[j], last = j, last, -1, j
+                if head[root] != -1:
+                    next_[last], prev[head[root]] = head[root], last
+                    last = tail[root]
+            if new_root == -1:
+                new_root = i
+            for root in merged:
+                if root != new_root:
+                    parent[root] = new_root
+                    size[new_root] += size[root]
+            for j in new_members:
+                grouped[j] = True
+                if j != new_root:
+                    parent[j] = new_root
+                    size[new_root] += 1
+            head[new_root], tail[new_root], builder[new_root] = i, last, i
+
+        done = set()
+        for i in range(n):
+            root = find(i)
+            if root in done:
+                continue
+            done.add(root)
+            box: LTTextBox
+            if isinstance(lines[builder[root]], LTTextLineHorizontal):
+                box = LTTextBoxHorizontal()
             else:
                 box = LTTextBoxVertical()
-            for obj in uniq(members):
-                box.add(obj)
-                boxes[obj] = box
-        done = set()
-        for line in lines:
-            if line not in boxes:
-                continue
-            box = boxes[line]
-            if box in done:
-                continue
-            done.add(box)
+            member = head[root]
+            while member != -1:
+                box.add(lines[member])
+                member = next_[member]
             if not box.is_empty():
                 yield box
 
